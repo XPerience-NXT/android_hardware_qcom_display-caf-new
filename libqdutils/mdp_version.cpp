@@ -52,6 +52,7 @@ enum mdp_rev {
 #else
 enum mdp_rev {
     MDSS_MDP_HW_REV_104 = 0x10040000, //Next version
+    MDSS_MDP_HW_REV_106 = 0x10060000, //8x16
     MDSS_MDP_HW_REV_206 = 0x20060000, //Future
     MDSS_MDP_HW_REV_107 = 0x10070000, //Next version
 };
