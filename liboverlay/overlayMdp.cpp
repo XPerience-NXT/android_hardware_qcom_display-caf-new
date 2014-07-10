@@ -22,11 +22,6 @@
 #include "mdp_version.h"
 #include <overlay.h>
 
-#ifdef USES_QSEED_SCALAR
-#include <scale/scale.h>
-using namespace scale;
-#endif
-
 #define HSIC_SETTINGS_DEBUG 0
 
 using namespace qdutils;
@@ -123,6 +118,23 @@ void MdpCtrl::setTransform(const utils::eTransform& orient) {
     int rot = utils::getMdpOrient(orient);
     setUserData(rot);
     mOrientation = static_cast<utils::eTransform>(rot);
+}
+
+void MdpCtrl::setPipeType(const utils::eMdpPipeType& pType){
+    switch((int) pType){
+        case utils::OV_MDP_PIPE_RGB:
+            mOVInfo.pipe_type = PIPE_TYPE_RGB;
+            break;
+        case utils::OV_MDP_PIPE_VG:
+            mOVInfo.pipe_type = PIPE_TYPE_VIG;
+            break;
+        case utils::OV_MDP_PIPE_DMA:
+            mOVInfo.pipe_type = PIPE_TYPE_DMA;
+            break;
+        default:
+            mOVInfo.pipe_type = PIPE_TYPE_AUTO;
+            break;
+    }
 }
 
 void MdpCtrl::doTransform() {
@@ -371,12 +383,11 @@ bool MdpCtrl::validateAndSet(MdpCtrl* mdpCtrlArray[], const int& count,
     list.num_overlays = count;
     list.overlay_list = ovArray;
 
-#ifdef USES_QSEED_SCALAR
-    Scale *scalar = Overlay::getScalar();
-    if(scalar) {
-        scalar->applyScale(&list);
+   int (*fnProgramScale)(struct mdp_overlay_list *) =
+        Overlay::getFnProgramScale();
+    if(fnProgramScale) {
+        fnProgramScale(&list);
     }
-#endif
 
     if(!mdp_wrapper::validateAndSet(fbFd, list)) {
         /* No dump for failure due to insufficient resource */

@@ -83,7 +83,8 @@ bool isValidResolution(hwc_context_t *ctx, uint32_t xres, uint32_t yres)
             (xres < MIN_DISPLAY_XRES || yres < MIN_DISPLAY_YRES));
 }
 
-void changeResolution(hwc_context_t *ctx, int xres_orig, int yres_orig) {
+void changeResolution(hwc_context_t *ctx, int xres_orig, int yres_orig,
+                      int width, int height) {
     //Store original display resolution.
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres_new = xres_orig;
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres_new = yres_orig;
@@ -99,6 +100,12 @@ void changeResolution(hwc_context_t *ctx, int xres_orig, int yres_orig) {
             ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres_new = xres_new;
             ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres_new = yres_new;
             ctx->dpyAttr[HWC_DISPLAY_PRIMARY].customFBSize = true;
+
+            //Caluculate DPI according to changed resolution.
+            float xdpi = ((float)xres_new * 25.4f) / (float)width;
+            float ydpi = ((float)yres_new * 25.4f) / (float)height;
+            ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xdpi = xdpi;
+            ctx->dpyAttr[HWC_DISPLAY_PRIMARY].ydpi = ydpi;
         }
     }
 }
@@ -168,7 +175,7 @@ static int openFramebufferDevice(hwc_context_t *ctx)
             (uint32_t)(1000000000l / fps);
 
     //To change resolution of primary display
-    changeResolution(ctx, info.xres, info.yres);
+    changeResolution(ctx, info.xres, info.yres, info.width, info.height);
 
     //Unblank primary on first boot
     if(ioctl(fb_fd, FBIOBLANK,FB_BLANK_UNBLANK) < 0) {
@@ -284,6 +291,7 @@ void initContext(hwc_context_t *ctx)
     ctx->mGPUHintInfo.mPrevCompositionGLES = false;
     ctx->mGPUHintInfo.mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
 #endif
+    memset(&(ctx->mPtorInfo), 0, sizeof(ctx->mPtorInfo));
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
 }
@@ -1082,6 +1090,21 @@ bool operator ==(const hwc_rect_t& lhs, const hwc_rect_t& rhs) {
     return false;
 }
 
+hwc_rect_t moveRect(const hwc_rect_t& rect, const int& x_off, const int& y_off)
+{
+    hwc_rect_t res;
+
+    if(!isValidRect(rect))
+        return (hwc_rect_t){0, 0, 0, 0};
+
+    res.left = rect.left + x_off;
+    res.top = rect.top + y_off;
+    res.right = rect.right + x_off;
+    res.bottom = rect.bottom + y_off;
+
+    return res;
+}
+
 /* computes the intersection of two rects */
 hwc_rect_t getIntersection(const hwc_rect_t& rect1, const hwc_rect_t& rect2)
 {
@@ -1283,6 +1306,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         if(ret < 0) {
             ALOGE("%s: ioctl MSMFB_BUFFER_SYNC failed for rot sync, err=%s",
                     __FUNCTION__, strerror(errno));
+            close(rotReleaseFd);
         } else {
             close(currLayer->acquireFenceFd);
             //For MDP to wait on.
@@ -1323,6 +1347,11 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         }
     }
 
+    if ((fd >= 0) && !dpy && ctx->mPtorInfo.isActive()) {
+        // Acquire c2d fence of Overlap render buffer
+        acquireFd[count++] = fd;
+    }
+
     data.acq_fen_fd_cnt = count;
     fbFd = ctx->dpyAttr[dpy].fd;
 
@@ -1340,6 +1369,10 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         ALOGE("%s: acq_fen_fd_cnt=%d flags=%d fd=%d dpy=%d numHwLayers=%zu",
               __FUNCTION__, data.acq_fen_fd_cnt, data.flags, fbFd,
               dpy, list->numHwLayers);
+        close(releaseFd);
+        releaseFd = -1;
+        close(retireFd);
+        retireFd = -1;
     }
 
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
@@ -1376,8 +1409,12 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         fd = -1;
     }
 
-    if (ctx->mCopyBit[dpy])
-        ctx->mCopyBit[dpy]->setReleaseFd(releaseFd);
+    if (!dpy && ctx->mCopyBit[dpy]) {
+        if (ctx->mPtorInfo.isActive())
+            ctx->mCopyBit[dpy]->setReleaseFdSync(releaseFd);
+        else
+            ctx->mCopyBit[dpy]->setReleaseFd(releaseFd);
+    }
 
     //Signals when MDP finishes reading rotator buffers.
     ctx->mLayerRotMap[dpy]->setReleaseFd(releaseFd);
@@ -2097,6 +2134,20 @@ void setGPUHint(hwc_context_t* ctx, hwc_display_contents_1_t* list) {
 #endif
 }
 
+bool isPeripheral(const hwc_rect_t& rect1, const hwc_rect_t& rect2) {
+    // To be peripheral, 3 boundaries should match.
+    uint8_t eqBounds = 0;
+    if (rect1.left == rect2.left)
+        eqBounds++;
+    if (rect1.top == rect2.top)
+        eqBounds++;
+    if (rect1.right == rect2.right)
+        eqBounds++;
+    if (rect1.bottom == rect2.bottom)
+        eqBounds++;
+    return (eqBounds == 3);
+}
+
 void BwcPM::setBwc(const hwc_rect_t& crop,
             const hwc_rect_t& dst, const int& transform,
             ovutils::eMdpFlags& mdpFlags) {
@@ -2185,6 +2236,9 @@ hwc_rect_t sanitizeROI(struct hwc_rect roi, hwc_rect boundary)
            t_roi.right = t_roi.left + MIN_WIDTH;
    }
 
+   if(LEFT_ALIGN)
+       t_roi.left = t_roi.left - (t_roi.left % LEFT_ALIGN);
+
    /* Align left and width to meet panel restrictions */
    if(WIDTH_ALIGN) {
        int width = t_roi.right - t_roi.left;
@@ -2194,13 +2248,16 @@ hwc_rect_t sanitizeROI(struct hwc_rect roi, hwc_rect boundary)
        if(t_roi.right > boundary.right) {
            t_roi.right = boundary.right;
            t_roi.left = t_roi.right - width;
+
+           if(LEFT_ALIGN)
+             t_roi.left = t_roi.left - (t_roi.left % LEFT_ALIGN);
        }
    }
 
-   if(LEFT_ALIGN)
-       t_roi.left = t_roi.left - (t_roi.left % LEFT_ALIGN);
-
    /* Align top and height to meet panel restrictions */
+   if(TOP_ALIGN)
+       t_roi.top = t_roi.top - (t_roi.top % TOP_ALIGN);
+
    if(HEIGHT_ALIGN) {
        int height = t_roi.bottom - t_roi.top;
        height = HEIGHT_ALIGN *  ((height + (HEIGHT_ALIGN - 1)) / HEIGHT_ALIGN);
@@ -2209,11 +2266,11 @@ hwc_rect_t sanitizeROI(struct hwc_rect roi, hwc_rect boundary)
        if(t_roi.bottom > boundary.bottom) {
            t_roi.bottom = boundary.bottom;
            t_roi.top = t_roi.bottom - height;
+
+           if(TOP_ALIGN)
+             t_roi.top = t_roi.top - (t_roi.top % TOP_ALIGN);
        }
    }
-
-   if(TOP_ALIGN)
-       t_roi.top = t_roi.top - (t_roi.top % TOP_ALIGN);
 
    return t_roi;
 }
