@@ -231,9 +231,6 @@ bool CopyBit::prepareOverlap(hwc_context_t *ctx,
         finalW = max(finalW, ALIGN((overlap.right - overlap.left), 32));
         finalH += ALIGN((overlap.bottom - overlap.top), 32);
         if(finalH > ALIGN((overlap.bottom - overlap.top), 32)) {
-            // Calculate the offset for RGBA(4BPP)
-            ptorInfo->mRenderBuffOffset[i] = finalW *
-                (finalH - ALIGN((overlap.bottom - overlap.top), 32)) * 4;
             // Calculate the dest top, left will always be zero
             ptorInfo->displayFrame[i].top = (finalH -
                                 (ALIGN((overlap.bottom - overlap.top), 32)));
@@ -1018,7 +1015,7 @@ struct copybit_device_t* CopyBit::getCopyBitDevice() {
 }
 
 CopyBit::CopyBit(hwc_context_t *ctx, const int& dpy) : mIsModeOn(false),
-        mCopyBitDraw(false), mCurRenderBufferIndex(0) {
+        mCopyBitDraw(false), mCurRenderBufferIndex(0), mEngine(0) {
 
     getBufferSizeAndDimensions(ctx->dpyAttr[dpy].xres,
             ctx->dpyAttr[dpy].yres,

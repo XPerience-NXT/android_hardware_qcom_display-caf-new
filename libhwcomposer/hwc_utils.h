@@ -125,16 +125,16 @@ struct ListStats {
     // Notifies hwcomposer about the start and end of animation
     // This will be set to true during animation, otherwise false.
     bool isDisplayAnimating;
-    ovutils::Dim roi;
     bool secureUI; // Secure display layer
     bool isSecurePresent;
+    hwc_rect_t lRoi;  //left ROI
+    hwc_rect_t rRoi;  //right ROI. Unused in single DSI panels.
 };
 
 //PTOR Comp info
 struct PtorInfo {
     int count;
     int layerIndex[MAX_PTOR_LAYERS];
-    int mRenderBuffOffset[MAX_PTOR_LAYERS];
     hwc_rect_t displayFrame[MAX_PTOR_LAYERS];
     bool isActive() { return (count>0); }
     int getPTORArrayIndex(int index) {
@@ -240,11 +240,6 @@ inline bool isNonIntegralSourceCrop(const hwc_frect_t& cropF) {
 // -----------------------------------------------------------------------------
 // Utility functions - implemented in hwc_utils.cpp
 void dumpLayer(hwc_layer_1_t const* l);
-
-// Calculate viewframe for external/primary display from primary resolution and
-// primary device orientation
-hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy);
-
 void setListStats(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         int dpy);
 void initContext(hwc_context_t *ctx);
@@ -256,6 +251,10 @@ void getNonWormholeRegion(hwc_display_contents_1_t* list,
                               hwc_rect_t& nwr);
 bool isSecuring(hwc_context_t* ctx, hwc_layer_1_t const* layer);
 bool isSecureModePolicy(int mdpVersion);
+// Returns true, if the input layer format is supported by rotator
+bool isRotatorSupportedFormat(private_handle_t *hnd);
+//Returns true, if the layer is YUV or the layer has been rendered by CPU
+bool isRotationDoable(hwc_context_t *ctx, private_handle_t *hnd);
 bool isExternalActive(hwc_context_t* ctx);
 bool isAlphaScaled(hwc_layer_1_t const* layer);
 bool needsScaling(hwc_layer_1_t const* layer);
@@ -316,8 +315,11 @@ int getMirrorModeOrientation(hwc_context_t *ctx);
 /* Get External State names */
 const char* getExternalDisplayState(uint32_t external_state);
 
+// Resets display ROI to full panel resoluion
+void resetROI(hwc_context_t *ctx, const int dpy);
+
 // Aligns updating ROI to panel restrictions
-hwc_rect_t sanitizeROI(struct hwc_rect roi, hwc_rect boundary);
+hwc_rect_t getSanitizeROI(struct hwc_rect roi, hwc_rect boundary);
 
 // Handles wfd Pause and resume events
 void handle_pause(hwc_context_t *ctx, int dpy);
@@ -331,7 +333,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         int fd);
 
 //Sets appropriate mdp flags for a layer.
-void setMdpFlags(hwc_layer_1_t *layer,
+void setMdpFlags(hwc_context_t *ctx, hwc_layer_1_t *layer,
         ovutils::eMdpFlags &mdpFlags,
         int rotDownscale, int transform);
 
@@ -349,7 +351,7 @@ int configColorLayer(hwc_context_t *ctx, hwc_layer_1_t *layer, const int& dpy,
         ovutils::eIsFg& isFg, const ovutils::eDest& dest);
 
 void updateSource(ovutils::eTransform& orient, ovutils::Whf& whf,
-        hwc_rect_t& crop);
+        hwc_rect_t& crop, overlay::Rotator *rot);
 
 //Routine to configure low resolution panels (<= 2048 width)
 int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer, const int& dpy,
@@ -414,6 +416,10 @@ static inline bool isSecureBuffer(const private_handle_t* hnd) {
 
 static inline bool isTileRendered(const private_handle_t* hnd) {
     return (hnd && (private_handle_t::PRIV_FLAGS_TILE_RENDERED & hnd->flags));
+}
+
+static inline bool isCPURendered(const private_handle_t* hnd) {
+    return (hnd && (private_handle_t::PRIV_FLAGS_CPU_RENDERED & hnd->flags));
 }
 
 //Return true if buffer is marked locked
@@ -587,7 +593,7 @@ static inline bool isYuvPresent (hwc_context_t *ctx, int dpy) {
     return  ctx->listStats[dpy].yuvCount;
 }
 
-static inline bool has90Transform(hwc_layer_1_t *layer) {
+static inline bool has90Transform(hwc_layer_1_t const* layer) {
     return ((layer->transform & HWC_TRANSFORM_ROT_90) &&
             !(layer->flags & HWC_COLOR_FILL));
 }
