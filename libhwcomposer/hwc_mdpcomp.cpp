@@ -43,8 +43,9 @@ bool MDPComp::sHandleTimeout = false;
 bool MDPComp::sDebugLogs = false;
 bool MDPComp::sEnabled = false;
 bool MDPComp::sEnableMixedMode = true;
+int MDPComp::sSimulationFlags = 0;
 int MDPComp::sMaxPipesPerMixer = MAX_PIPES_PER_MIXER;
-bool MDPComp::sEnable4k2kYUVSplit = false;
+bool MDPComp::sEnableYUVsplit = false;
 bool MDPComp::sSrcSplitEnabled = false;
 MDPComp* MDPComp::getObject(hwc_context_t *ctx, const int& dpy) {
     if(qdutils::MDPVersion::getInstance().isSrcSplit()) {
@@ -160,10 +161,11 @@ bool MDPComp::init(hwc_context_t *ctx) {
     }
 
     if(!qdutils::MDPVersion::getInstance().isSrcSplit() &&
+        !qdutils::MDPVersion::getInstance().isRotDownscaleEnabled() &&
             property_get("persist.mdpcomp.4k2kSplit", property, "0") > 0 &&
             (!strncmp(property, "1", PROPERTY_VALUE_MAX) ||
             !strncasecmp(property,"true", PROPERTY_VALUE_MAX))) {
-        sEnable4k2kYUVSplit = true;
+        sEnableYUVsplit = true;
     }
 
     if ((property_get("persist.hwc.ptor.enable", property, NULL) > 0) &&
@@ -241,11 +243,12 @@ void MDPComp::setRedraw(hwc_context_t *ctx,
 }
 
 MDPComp::FrameInfo::FrameInfo() {
+    memset(&mdpToLayer, 0, sizeof(mdpToLayer));
     reset(0);
 }
 
 void MDPComp::FrameInfo::reset(const int& numLayers) {
-    for(int i = 0 ; i < MAX_PIPES_PER_MIXER && numLayers; i++ ) {
+    for(int i = 0; i < MAX_PIPES_PER_MIXER; i++) {
         if(mdpToLayer[i].pipeInfo) {
             delete mdpToLayer[i].pipeInfo;
             mdpToLayer[i].pipeInfo = NULL;
@@ -353,6 +356,7 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
     int dst_h = dst.bottom - dst.top;
     float w_scale = ((float)crop_w / (float)dst_w);
     float h_scale = ((float)crop_h / (float)dst_h);
+    MDPVersion& mdpHw = MDPVersion::getInstance();
 
     /* Workaround for MDP HW limitation in DSI command mode panels where
      * FPS will not go beyond 30 if buffers on RGB pipes are of width or height
@@ -364,29 +368,29 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
         return false;
 
     if((w_scale > 1.0f) || (h_scale > 1.0f)) {
-        const uint32_t maxMDPDownscale =
-            qdutils::MDPVersion::getInstance().getMaxMDPDownscale();
+        const uint32_t maxMDPDownscale = mdpHw.getMaxMDPDownscale();
         const float w_dscale = w_scale;
         const float h_dscale = h_scale;
 
         if(ctx->mMDP.version >= qdutils::MDSS_V5) {
 
-            if(!qdutils::MDPVersion::getInstance().supportsDecimation()) {
+            if(!mdpHw.supportsDecimation()) {
                 /* On targets that doesnt support Decimation (eg.,8x26)
                  * maximum downscale support is overlay pipe downscale.
                  */
-                if(crop_w > MAX_DISPLAY_DIM || w_dscale > maxMDPDownscale ||
+                if(crop_w > mdpHw.getMaxMixerWidth() ||
+                        w_dscale > maxMDPDownscale ||
                         h_dscale > maxMDPDownscale)
                     return false;
             } else {
                 // Decimation on macrotile format layers is not supported.
                 if(isTileRendered(hnd)) {
-                    /* MDP can read maximum MAX_DISPLAY_DIM width.
-                     * Bail out if
-                     *      1. Src crop > MAX_DISPLAY_DIM on nonsplit MDPComp
+                    /* Bail out if
+                     *      1. Src crop > Mixer limit on nonsplit MDPComp
                      *      2. exceeds maximum downscale limit
                      */
-                    if(((crop_w > MAX_DISPLAY_DIM) && !sSrcSplitEnabled) ||
+                    if(((crop_w > mdpHw.getMaxMixerWidth()) &&
+                                !sSrcSplitEnabled) ||
                             w_dscale > maxMDPDownscale ||
                             h_dscale > maxMDPDownscale) {
                         return false;
@@ -401,8 +405,7 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
     }
 
     if((w_scale < 1.0f) || (h_scale < 1.0f)) {
-        const uint32_t upscale =
-            qdutils::MDPVersion::getInstance().getMaxMDPUpscale();
+        const uint32_t upscale = mdpHw.getMaxMDPUpscale();
         const float w_uscale = 1.0f / w_scale;
         const float h_uscale = 1.0f / h_scale;
 
@@ -420,7 +423,8 @@ bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
         ALOGD_IF(isDebug(),"%s: MDP Comp. not enabled.", __FUNCTION__);
         ret = false;
     } else if((qdutils::MDPVersion::getInstance().is8x26() ||
-               qdutils::MDPVersion::getInstance().is8x16()) &&
+               qdutils::MDPVersion::getInstance().is8x16() ||
+               qdutils::MDPVersion::getInstance().is8x39()) &&
             ctx->mVideoTransFlag &&
             isSecondaryConnected(ctx)) {
         //1 Padding round to shift pipes across mixers
@@ -679,7 +683,9 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
     const int numAppLayers = ctx->listStats[mDpy].numAppLayers;
     int priDispW = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres;
 
-    if(sIdleFallBack && !ctx->listStats[mDpy].secureUI) {
+    // No Idle fall back, if secure display or secure RGB layers are present
+    if(sIdleFallBack && (!ctx->listStats[mDpy].secureUI &&
+                    !ctx->listStats[mDpy].secureRGBCount)) {
         ALOGD_IF(isDebug(), "%s: Idle fallback dpy %d",__FUNCTION__, mDpy);
         return false;
     }
@@ -691,8 +697,10 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         return false;
     }
 
-    if(mDpy > HWC_DISPLAY_PRIMARY && (priDispW > MAX_DISPLAY_DIM) &&
-                              (ctx->dpyAttr[mDpy].xres < MAX_DISPLAY_DIM)) {
+    MDPVersion& mdpHw = MDPVersion::getInstance();
+    if(mDpy > HWC_DISPLAY_PRIMARY &&
+            (priDispW >  mdpHw.getMaxMixerWidth()) &&
+            (ctx->dpyAttr[mDpy].xres <  mdpHw.getMaxMixerWidth())) {
         // Disable MDP comp on Secondary when the primary is highres panel and
         // the secondary is a normal 1080p, because, MDP comp on secondary under
         // in such usecase, decimation gets used for downscale and there will be
@@ -724,11 +732,9 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         //For 8x26 with panel width>1k, if RGB layer needs HFLIP fail mdp comp
         // may not need it if Gfx pre-rotation can handle all flips & rotations
         int transform = (layer->flags & HWC_COLOR_FILL) ? 0 : layer->transform;
-        if(qdutils::MDPVersion::getInstance().is8x26() &&
-                                (ctx->dpyAttr[mDpy].xres > 1024) &&
-                                (transform & HWC_TRANSFORM_FLIP_H) &&
-                                (!isYuvBuffer(hnd)))
-                   return false;
+        if( mdpHw.is8x26() && (ctx->dpyAttr[mDpy].xres > 1024) &&
+                (transform & HWC_TRANSFORM_FLIP_H) && (!isYuvBuffer(hnd)))
+            return false;
     }
 
     if(ctx->mAD->isDoable()) {
@@ -749,6 +755,10 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
 }
 
 bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
+
+    if(sSimulationFlags & MDPCOMP_AVOID_FULL_MDP)
+        return false;
+
     //Will benefit presentation / secondary-only layer.
     if((mDpy > HWC_DISPLAY_PRIMARY) &&
             (list->numHwLayers - 1) > MAX_SEC_LAYERS) {
@@ -772,7 +782,7 @@ bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     mCurrentFrame.mdpCount = mCurrentFrame.layerCount - mCurrentFrame.fbCount -
         mCurrentFrame.dropCount;
 
-    if(sEnable4k2kYUVSplit){
+    if(sEnableYUVsplit){
         adjustForSourceSplit(ctx, list);
     }
 
@@ -781,7 +791,8 @@ bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
         reset(ctx);
         return false;
     }
-
+    ALOGD_IF(sSimulationFlags,"%s: FULL_MDP_COMP SUCCEEDED",
+             __FUNCTION__);
     return true;
 }
 
@@ -905,6 +916,11 @@ bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
     private_handle_t *renderBuf = ctx->mCopyBit[mDpy]->getCurrentRenderBuffer();
     Whf layerWhf[numPTORLayersFound]; // To store w,h,f of PTOR layers
 
+    // Store the blending mode, planeAlpha, and transform of PTOR layers
+    int32_t blending[numPTORLayersFound];
+    uint8_t planeAlpha[numPTORLayersFound];
+    uint32_t transform[numPTORLayersFound];
+
     for(int j = 0; j < numPTORLayersFound; j++) {
         int index =  ctx->mPtorInfo.layerIndex[j];
 
@@ -922,6 +938,14 @@ bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
         hnd->width = renderBuf->width;
         hnd->height = renderBuf->height;
         hnd->format = renderBuf->format;
+
+        // Store & update blending mode, planeAlpha and transform of PTOR layer
+        blending[j] = layer->blending;
+        planeAlpha[j] = layer->planeAlpha;
+        transform[j] = layer->transform;
+        layer->blending = HWC_BLENDING_NONE;
+        layer->planeAlpha = 0xFF;
+        layer->transform = 0;
 
         // Remove overlap from crop & displayFrame of below layers
         for (int i = 0; i < index && index !=-1; i++) {
@@ -962,13 +986,17 @@ bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
         layer->sourceCropf.bottom = (float)sourceCrop[i].bottom;
     }
 
-    // Restore w,h,f of PTOR layers
+    // Restore w,h,f, blending attributes, and transform of PTOR layers
     for (int i = 0; i < numPTORLayersFound; i++) {
         int idx = ctx->mPtorInfo.layerIndex[i];
+        hwc_layer_1_t* layer = &list->hwLayers[idx];
         private_handle_t *hnd = (private_handle_t *)list->hwLayers[idx].handle;
         hnd->width = layerWhf[i].w;
         hnd->height = layerWhf[i].h;
         hnd->format = layerWhf[i].format;
+        layer->blending = blending[i];
+        layer->planeAlpha = planeAlpha[i];
+        layer->transform = transform[i];
     }
 
     if (!result) {
@@ -1006,6 +1034,9 @@ bool MDPComp::partialMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list)
 
 bool MDPComp::cacheBasedComp(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
+    if(sSimulationFlags & MDPCOMP_AVOID_CACHE_MDP)
+        return false;
+
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
     mCurrentFrame.reset(numAppLayers);
     updateLayerCache(ctx, list);
@@ -1024,6 +1055,8 @@ bool MDPComp::cacheBasedComp(hwc_context_t *ctx,
     }
 
     updateYUV(ctx, list, false /*secure only*/);
+    /* mark secure RGB layers for MDP comp */
+    updateSecureRGB(ctx, list);
     bool ret = markLayersForCaching(ctx, list); //sets up fbZ also
     if(!ret) {
         ALOGD_IF(isDebug(),"%s: batching failed, dpy %d",__FUNCTION__, mDpy);
@@ -1033,7 +1066,7 @@ bool MDPComp::cacheBasedComp(hwc_context_t *ctx,
 
     int mdpCount = mCurrentFrame.mdpCount;
 
-    if(sEnable4k2kYUVSplit){
+    if(sEnableYUVsplit){
         adjustForSourceSplit(ctx, list);
     }
 
@@ -1050,12 +1083,17 @@ bool MDPComp::cacheBasedComp(hwc_context_t *ctx,
         reset(ctx);
         return false;
     }
+    ALOGD_IF(sSimulationFlags,"%s: CACHE_MDP_COMP SUCCEEDED",
+             __FUNCTION__);
 
     return true;
 }
 
 bool MDPComp::loadBasedComp(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
+    if(sSimulationFlags & MDPCOMP_AVOID_LOAD_MDP)
+        return false;
+
     if(not isLoadBasedCompDoable(ctx)) {
         return false;
     }
@@ -1127,7 +1165,9 @@ bool MDPComp::loadBasedComp(hwc_context_t *ctx,
 
         if(postHeuristicsHandling(ctx, list)) {
             ALOGD_IF(isDebug(), "%s: Postheuristics handling succeeded",
-                    __FUNCTION__);
+                     __FUNCTION__);
+            ALOGD_IF(sSimulationFlags,"%s: LOAD_MDP_COMP SUCCEEDED",
+                     __FUNCTION__);
             return true;
         }
 
@@ -1154,6 +1194,8 @@ bool MDPComp::canPartialUpdate(hwc_context_t *ctx,
             mDpy ) {
         return false;
     }
+    if(ctx->listStats[mDpy].secureUI)
+        return false;
     return true;
 }
 
@@ -1166,6 +1208,8 @@ bool MDPComp::tryVideoOnly(hwc_context_t *ctx,
 
 bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
         hwc_display_contents_1_t* list, bool secureOnly) {
+    if(sSimulationFlags & MDPCOMP_AVOID_VIDEO_ONLY)
+        return false;
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
 
     mCurrentFrame.reset(numAppLayers);
@@ -1188,7 +1232,7 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
     if(mCurrentFrame.fbCount)
         mCurrentFrame.fbZ = mCurrentFrame.mdpCount;
 
-    if(sEnable4k2kYUVSplit){
+    if(sEnableYUVsplit){
         adjustForSourceSplit(ctx, list);
     }
 
@@ -1198,6 +1242,66 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
         return false;
     }
 
+    ALOGD_IF(sSimulationFlags,"%s: VIDEO_ONLY_COMP SUCCEEDED",
+             __FUNCTION__);
+    return true;
+}
+
+/* if tryFullFrame fails, try to push all video and secure RGB layers to MDP */
+bool MDPComp::tryMDPOnlyLayers(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list) {
+    const bool secureOnly = true;
+    return mdpOnlyLayersComp(ctx, list, not secureOnly) or
+            mdpOnlyLayersComp(ctx, list, secureOnly);
+
+}
+
+bool MDPComp::mdpOnlyLayersComp(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list, bool secureOnly) {
+
+    if(sSimulationFlags & MDPCOMP_AVOID_MDP_ONLY_LAYERS)
+        return false;
+
+    /* Bail out if we are processing only secured video layers
+     * and we dont have any */
+    if(!isSecurePresent(ctx, mDpy) && secureOnly){
+        reset(ctx);
+        return false;
+    }
+
+    int numAppLayers = ctx->listStats[mDpy].numAppLayers;
+    mCurrentFrame.reset(numAppLayers);
+    mCurrentFrame.fbCount -= mCurrentFrame.dropCount;
+
+    updateYUV(ctx, list, secureOnly);
+    /* mark secure RGB layers for MDP comp */
+    updateSecureRGB(ctx, list);
+
+    if(mCurrentFrame.mdpCount == 0) {
+        reset(ctx);
+        return false;
+    }
+
+    /* find the maximum batch of layers to be marked for framebuffer */
+    bool ret = markLayersForCaching(ctx, list); //sets up fbZ also
+    if(!ret) {
+        ALOGD_IF(isDebug(),"%s: batching failed, dpy %d",__FUNCTION__, mDpy);
+        reset(ctx);
+        return false;
+    }
+
+    if(sEnableYUVsplit){
+        adjustForSourceSplit(ctx, list);
+    }
+
+    if(!postHeuristicsHandling(ctx, list)) {
+        ALOGD_IF(isDebug(), "post heuristic handling failed");
+        reset(ctx);
+        return false;
+    }
+
+    ALOGD_IF(sSimulationFlags,"%s: MDP_ONLY_LAYERS_COMP SUCCEEDED",
+             __FUNCTION__);
     return true;
 }
 
@@ -1231,6 +1335,27 @@ bool MDPComp::isYUVDoable(hwc_context_t* ctx, hwc_layer_1_t* layer) {
         return false;
     }
 
+    return true;
+}
+
+/* Checks for conditions where Secure RGB layers cannot be bypassed */
+bool MDPComp::isSecureRGBDoable(hwc_context_t* ctx, hwc_layer_1_t* layer) {
+    if(isSkipLayer(layer)) {
+        ALOGD_IF(isDebug(), "%s: Secure RGB layer marked SKIP dpy %d",
+            __FUNCTION__, mDpy);
+        return false;
+    }
+
+    if(isSecuring(ctx, layer)) {
+        ALOGD_IF(isDebug(), "%s: MDP securing is active", __FUNCTION__);
+        return false;
+    }
+
+    if(not isSupportedForMDPComp(ctx, layer)) {
+        ALOGD_IF(isDebug(), "%s: Unsupported secure RGB layer",
+            __FUNCTION__);
+        return false;
+    }
     return true;
 }
 
@@ -1451,6 +1576,32 @@ void MDPComp::updateYUV(hwc_context_t* ctx, hwc_display_contents_1_t* list,
              mCurrentFrame.fbCount);
 }
 
+void MDPComp::updateSecureRGB(hwc_context_t* ctx,
+    hwc_display_contents_1_t* list) {
+    int nSecureRGBCount = ctx->listStats[mDpy].secureRGBCount;
+    for(int index = 0;index < nSecureRGBCount; index++){
+        int nSecureRGBIndex = ctx->listStats[mDpy].secureRGBIndices[index];
+        hwc_layer_1_t* layer = &list->hwLayers[nSecureRGBIndex];
+
+        if(!isSecureRGBDoable(ctx, layer)) {
+            if(!mCurrentFrame.isFBComposed[nSecureRGBIndex]) {
+                mCurrentFrame.isFBComposed[nSecureRGBIndex] = true;
+                mCurrentFrame.fbCount++;
+            }
+        } else {
+            if(mCurrentFrame.isFBComposed[nSecureRGBIndex]) {
+                mCurrentFrame.isFBComposed[nSecureRGBIndex] = false;
+                mCurrentFrame.fbCount--;
+            }
+        }
+    }
+
+    mCurrentFrame.mdpCount = mCurrentFrame.layerCount -
+            mCurrentFrame.fbCount - mCurrentFrame.dropCount;
+    ALOGD_IF(isDebug(),"%s: fb count: %d",__FUNCTION__,
+             mCurrentFrame.fbCount);
+}
+
 hwc_rect_t MDPComp::getUpdatingFBRect(hwc_context_t *ctx,
         hwc_display_contents_1_t* list){
     hwc_rect_t fbRect = (struct hwc_rect){0, 0, 0, 0};
@@ -1514,7 +1665,7 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
             cur_pipe->zOrder = mdpNextZOrder++;
 
             private_handle_t *hnd = (private_handle_t *)layer->handle;
-            if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit){
+            if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
                 if(configure4k2kYuv(ctx, layer,
                             mCurrentFrame.mdpToLayer[mdpIndex])
                         != 0 ){
@@ -1625,6 +1776,16 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     }
 
     const int numLayers = ctx->listStats[mDpy].numAppLayers;
+    char property[PROPERTY_VALUE_MAX];
+
+    if(property_get("debug.hwc.simulate", property, NULL) > 0) {
+        int currentFlags = atoi(property);
+        if(currentFlags != sSimulationFlags) {
+            sSimulationFlags = currentFlags;
+            ALOGE("%s: Simulation Flag read: 0x%x (%d)", __FUNCTION__,
+                    sSimulationFlags, sSimulationFlags);
+        }
+    }
 
     // reset PTOR
     if(!mDpy)
@@ -1663,7 +1824,10 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     if(isFrameDoable(ctx)) {
         generateROI(ctx, list);
 
-        mModeOn = tryFullFrame(ctx, list) || tryVideoOnly(ctx, list);
+        // if tryFullFrame fails, try to push all video and secure RGB layers
+        // to MDP for composition.
+        mModeOn = tryFullFrame(ctx, list) || tryMDPOnlyLayers(ctx, list) ||
+                  tryVideoOnly(ctx, list);
         if(mModeOn) {
             setMDPCompLayerFlags(ctx, list);
         } else {
@@ -1743,6 +1907,8 @@ void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
     //fbz is above 4k2k layer, increment fb zorder by 1
     //as we split 4k2k layer and increment zorder for right half
     //of the layer
+    if(!ctx)
+        return;
     if(mCurrentFrame.fbZ >= 0) {
         for (int index = 0, mdpNextZOrder = 0; index < mCurrentFrame.layerCount;
                 index++) {
@@ -1753,7 +1919,7 @@ void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
                 mdpNextZOrder++;
                 hwc_layer_1_t* layer = &list->hwLayers[index];
                 private_handle_t *hnd = (private_handle_t *)layer->handle;
-                if(is4kx2kYuvBuffer(hnd)) {
+                if(isYUVSplitNeeded(hnd)) {
                     if(mdpNextZOrder <= mCurrentFrame.fbZ)
                         mCurrentFrame.fbZ += 1;
                     mdpNextZOrder++;
@@ -1775,13 +1941,12 @@ int MDPCompNonSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
         *(static_cast<MdpPipeInfoNonSplit*>(PipeLayerPair.pipeInfo));
     eMdpFlags mdpFlags = OV_MDP_BACKEND_COMPOSITION;
     eZorder zOrder = static_cast<eZorder>(mdp_info.zOrder);
-    eIsFg isFg = IS_FG_OFF;
     eDest dest = mdp_info.index;
 
     ALOGD_IF(isDebug(),"%s: configuring: layer: %p z_order: %d dest_pipe: %d",
              __FUNCTION__, layer, zOrder, dest);
 
-    return configureNonSplit(ctx, layer, mDpy, mdpFlags, zOrder, isFg, dest,
+    return configureNonSplit(ctx, layer, mDpy, mdpFlags, zOrder, dest,
                            &PipeLayerPair.rot);
 }
 
@@ -1793,7 +1958,7 @@ bool MDPCompNonSplit::allocLayerPipes(hwc_context_t *ctx,
 
         hwc_layer_1_t* layer = &list->hwLayers[index];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
-        if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit){
+        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
             if(allocSplitVGPipesfor4k2k(ctx, index)){
                 continue;
             }
@@ -1830,12 +1995,11 @@ int MDPCompNonSplit::configure4k2kYuv(hwc_context_t *ctx, hwc_layer_1_t *layer,
     MdpYUVPipeInfo& mdp_info =
             *(static_cast<MdpYUVPipeInfo*>(PipeLayerPair.pipeInfo));
     eZorder zOrder = static_cast<eZorder>(mdp_info.zOrder);
-    eIsFg isFg = IS_FG_OFF;
     eMdpFlags mdpFlagsL = OV_MDP_BACKEND_COMPOSITION;
     eDest lDest = mdp_info.lIndex;
     eDest rDest = mdp_info.rIndex;
 
-    return configureSourceSplit(ctx, layer, mDpy, mdpFlagsL, zOrder, isFg,
+    return configureSourceSplit(ctx, layer, mDpy, mdpFlagsL, zOrder,
             lDest, rDest, &PipeLayerPair.rot);
 }
 
@@ -1873,7 +2037,7 @@ bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
         int mdpIndex = mCurrentFrame.layerToMDP[i];
 
-        if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit)
+        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit)
         {
             MdpYUVPipeInfo& pipe_info =
                 *(MdpYUVPipeInfo*)mCurrentFrame.mdpToLayer[mdpIndex].pipeInfo;
@@ -1972,7 +2136,7 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
                 mdpNextZOrder++;
                 hwc_layer_1_t* layer = &list->hwLayers[index];
                 private_handle_t *hnd = (private_handle_t *)layer->handle;
-                if(is4kx2kYuvBuffer(hnd)) {
+                if(isYUVSplitNeeded(hnd)) {
                     hwc_rect_t dst = layer->displayFrame;
                     if((dst.left > lSplit) || (dst.right < lSplit)) {
                         mCurrentFrame.mdpCount += 1;
@@ -2033,7 +2197,7 @@ bool MDPCompSplit::allocLayerPipes(hwc_context_t *ctx,
         private_handle_t *hnd = (private_handle_t *)layer->handle;
         hwc_rect_t dst = layer->displayFrame;
         const int lSplit = getLeftSplit(ctx, mDpy);
-        if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit){
+        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
             if((dst.left > lSplit)||(dst.right < lSplit)){
                 if(allocSplitVGPipesfor4k2k(ctx, index)){
                     continue;
@@ -2063,12 +2227,11 @@ int MDPCompSplit::configure4k2kYuv(hwc_context_t *ctx, hwc_layer_1_t *layer,
         MdpYUVPipeInfo& mdp_info =
                 *(static_cast<MdpYUVPipeInfo*>(PipeLayerPair.pipeInfo));
         eZorder zOrder = static_cast<eZorder>(mdp_info.zOrder);
-        eIsFg isFg = IS_FG_OFF;
         eMdpFlags mdpFlagsL = OV_MDP_BACKEND_COMPOSITION;
         eDest lDest = mdp_info.lIndex;
         eDest rDest = mdp_info.rIndex;
 
-        return configureSourceSplit(ctx, layer, mDpy, mdpFlagsL, zOrder, isFg,
+        return configureSourceSplit(ctx, layer, mDpy, mdpFlagsL, zOrder,
                 lDest, rDest, &PipeLayerPair.rot);
     }
     else{
@@ -2084,7 +2247,6 @@ int MDPCompSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     MdpPipeInfoSplit& mdp_info =
         *(static_cast<MdpPipeInfoSplit*>(PipeLayerPair.pipeInfo));
     eZorder zOrder = static_cast<eZorder>(mdp_info.zOrder);
-    eIsFg isFg = IS_FG_OFF;
     eMdpFlags mdpFlagsL = OV_MDP_BACKEND_COMPOSITION;
     eDest lDest = mdp_info.lIndex;
     eDest rDest = mdp_info.rIndex;
@@ -2092,7 +2254,7 @@ int MDPCompSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     ALOGD_IF(isDebug(),"%s: configuring: layer: %p z_order: %d dest_pipeL: %d"
              "dest_pipeR: %d",__FUNCTION__, layer, zOrder, lDest, rDest);
 
-    return configureSplit(ctx, layer, mDpy, mdpFlagsL, zOrder, isFg, lDest,
+    return configureSplit(ctx, layer, mDpy, mdpFlagsL, zOrder, lDest,
                             rDest, &PipeLayerPair.rot);
 }
 
@@ -2129,7 +2291,7 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
         int mdpIndex = mCurrentFrame.layerToMDP[i];
 
-        if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit)
+        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit)
         {
             MdpYUVPipeInfo& pipe_info =
                 *(MdpYUVPipeInfo*)mCurrentFrame.mdpToLayer[mdpIndex].pipeInfo;
@@ -2258,14 +2420,15 @@ bool MDPCompSrcSplit::acquireMDPPipes(hwc_context_t *ctx, hwc_layer_1_t* layer,
            if the layer's width is > mixer's width
     */
 
+    MDPVersion& mdpHw = MDPVersion::getInstance();
     bool primarySplitAlways = (mDpy == HWC_DISPLAY_PRIMARY) and
-            qdutils::MDPVersion::getInstance().isSrcSplitAlways();
+            mdpHw.isSrcSplitAlways();
     int lSplit = getLeftSplit(ctx, mDpy);
     int dstWidth = dst.right - dst.left;
     int cropWidth = crop.right - crop.left;
 
-    if(dstWidth > qdutils::MAX_DISPLAY_DIM or
-            cropWidth > qdutils::MAX_DISPLAY_DIM or
+    if(dstWidth > mdpHw.getMaxMixerWidth() or
+            cropWidth > mdpHw.getMaxMixerWidth() or
             (primarySplitAlways and (cropWidth > lSplit))) {
         pipe_info.rIndex = ctx->mOverlay->getPipe(pipeSpecs);
         if(pipe_info.rIndex == ovutils::OV_INVALID) {
@@ -2297,14 +2460,12 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
         *(static_cast<MdpPipeInfoSplit*>(PipeLayerPair.pipeInfo));
     Rotator **rot = &PipeLayerPair.rot;
     eZorder z = static_cast<eZorder>(mdp_info.zOrder);
-    eIsFg isFg = IS_FG_OFF;
     eDest lDest = mdp_info.lIndex;
     eDest rDest = mdp_info.rIndex;
     hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
     hwc_rect_t dst = layer->displayFrame;
     int transform = layer->transform;
     eTransform orient = static_cast<eTransform>(transform);
-    const int downscale = 0;
     int rotFlags = ROT_FLAGS_NONE;
     uint32_t format = ovutils::getMdpFormat(hnd->format, isTileRendered(hnd));
     Whf whf(getWidth(hnd), getHeight(hnd), format, hnd->size);
@@ -2320,21 +2481,22 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
             whf.format = getMdpFormat(HAL_PIXEL_FORMAT_BGRX_8888);
     }
 
+    int downscale = getRotDownscale(ctx, layer);
     eMdpFlags mdpFlags = OV_MDP_BACKEND_COMPOSITION;
-    setMdpFlags(ctx, layer, mdpFlags, 0, transform);
+    setMdpFlags(ctx, layer, mdpFlags, downscale, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
         //Enable overfetch
         setMdpFlags(mdpFlags, OV_MDSS_MDP_DUAL_PIPE);
     }
 
-    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
+    if((has90Transform(layer) or downscale) and isRotationDoable(ctx, hnd)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[mDpy]->add(layer, *rot);
         //If the video is using a single pipe, enable BWC
         if(rDest == OV_INVALID) {
-            BwcPM::setBwc(crop, dst, transform, mdpFlags);
+            BwcPM::setBwc(crop, dst, transform, downscale, mdpFlags);
         }
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlags, orient, downscale) < 0) {
@@ -2342,7 +2504,7 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
             return -1;
         }
         updateSource(orient, whf, crop, *rot);
-        rotFlags |= ROT_PREROTATED;
+        rotFlags |= ovutils::ROT_PREROTATED;
     }
 
     //If 2 pipes being used, divide layer into half, crop and dst
@@ -2355,14 +2517,24 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
         cropR.left = cropL.right;
         sanitizeSourceCrop(cropL, cropR, hnd);
 
+        bool cropSwap = false;
         //Swap crops on H flip since 2 pipes are being used
         if((orient & OVERLAY_TRANSFORM_FLIP_H) && (*rot) == NULL) {
             hwc_rect_t tmp = cropL;
             cropL = cropR;
             cropR = tmp;
+            cropSwap = true;
         }
 
-        dstL.right = (dst.right + dst.left) / 2;
+        //cropSwap trick: If the src and dst widths are both odd, let us say
+        //2507, then splitting both into half would cause left width to be 1253
+        //and right 1254. If crop is swapped because of H flip, this will cause
+        //left crop width to be 1254, whereas left dst width remains 1253, thus
+        //inducing a scaling that is unaccounted for. To overcome that we add 1
+        //to the dst width if there is a cropSwap. So if the original width was
+        //2507, the left dst width will be 1254. Even if the original width was
+        //even for ex: 2508, the left dst width will still remain 1254.
+        dstL.right = (dst.right + dst.left + cropSwap) / 2;
         dstR.left = dstL.right;
     }
 
@@ -2372,7 +2544,7 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
     //configure left pipe
     if(lDest != OV_INVALID) {
-        PipeArgs pargL(mdpFlags, whf, z, isFg,
+        PipeArgs pargL(mdpFlags, whf, z,
                 static_cast<eRotFlags>(rotFlags), layer->planeAlpha,
                 (ovutils::eBlending) getBlending(layer->blending));
 
@@ -2385,7 +2557,7 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
     //configure right pipe
     if(rDest != OV_INVALID) {
-        PipeArgs pargR(mdpFlags, whf, z, isFg,
+        PipeArgs pargR(mdpFlags, whf, z,
                 static_cast<eRotFlags>(rotFlags),
                 layer->planeAlpha,
                 (ovutils::eBlending) getBlending(layer->blending));
